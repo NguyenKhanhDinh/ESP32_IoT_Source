@@ -1,0 +1,9 @@
+# Go build output
+backend/*.exe
+
+# Environment / secrets
+backend/.env
+
+# OS files
+.DS_Store
+Thumbs.db

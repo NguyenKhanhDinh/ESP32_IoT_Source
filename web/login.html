@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Admin Login</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: #181818;
+            color: white;
+
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .login-card {
+            width: 380px;
+            background: #282828;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 5px 25px rgba(0, 0, 0, 0.4);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #ccc;
+        }
+
+        input {
+            width: 100%;
+            padding: 13px;
+            margin-bottom: 20px;
+
+            border: none;
+            border-radius: 8px;
+
+            background: #3a3a3a;
+            color: white;
+
+            font-size: 16px;
+        }
+
+        button {
+            width: 100%;
+            padding: 13px;
+
+            border: none;
+            border-radius: 8px;
+
+            background: #4a90e2;
+            color: white;
+
+            font-size: 16px;
+            font-weight: bold;
+
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #357abd;
+        }
+
+        #error {
+            margin-top: 15px;
+            text-align: center;
+            color: #ff6b6b;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="login-card">
+
+    <h1>Admin Login</h1>
+
+    <form id="loginForm">
+
+        <label for="username">Username</label>
+
+        <input
+            id="username"
+            type="text"
+            placeholder="Enter username"
+            required
+        >
+
+        <label for="password">Password</label>
+
+        <input
+            id="password"
+            type="password"
+            placeholder="Enter password"
+            required
+        >
+
+        <button type="submit">
+            Login
+        </button>
+
+    </form>
+
+    <div id="error"></div>
+
+</div>
+
+<script>
+    document.getElementById("loginForm").addEventListener("submit", async function (event) {
+
+        event.preventDefault();
+
+        const username =
+            document.getElementById("username").value;
+
+        const password =
+            document.getElementById("password").value;
+
+        const errorElement =
+            document.getElementById("error");
+
+        errorElement.textContent = "";
+
+        try {
+
+            const response = await fetch("/api/login", {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify({
+                    username: username,
+                    password: password
+                })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                errorElement.textContent =
+                    data.error || "Login failed";
+
+                return;
+            }
+
+            window.location.href = "/";
+
+        } catch (error) {
+
+            console.error(error);
+
+            errorElement.textContent =
+                "Cannot connect to backend";
+        }
+    });
+</script>
+
+</body>
+</html>
