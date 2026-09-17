@@ -538,8 +538,12 @@ func main() {
 	)
 
 	opts.SetClientID(
-		"go-iot-backend",
+		"go-iot-backend-render",
 	)
+
+	opts.SetKeepAlive(30 * time.Second)
+	opts.SetPingTimeout(10 * time.Second)
+	opts.SetAutoReconnect(true)
 
 	// --------------------------------------------------
 	// TLS
