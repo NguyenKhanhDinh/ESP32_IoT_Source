@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -9,13 +10,24 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/joho/godotenv"
+
 	_ "github.com/lib/pq"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+// ======================================================
+// DATA STRUCTURES
+// ======================================================
 
 type Telemetry struct {
 	Temperature float64 `json:"temperature"`
@@ -28,7 +40,15 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
+// ======================================================
+// DATABASE
+// ======================================================
+
 var db *sql.DB
+
+// ======================================================
+// LATEST TELEMETRY - RAM CACHE
+// ======================================================
 
 var (
 	latestData    Telemetry
@@ -36,6 +56,7 @@ var (
 	dataMu        sync.RWMutex
 )
 
+// Get latest telemetry from RAM
 func getLatestData() (Telemetry, bool) {
 	dataMu.RLock()
 	defer dataMu.RUnlock()
@@ -43,18 +64,25 @@ func getLatestData() (Telemetry, bool) {
 	return latestData, hasLatestData
 }
 
+// Update latest telemetry in RAM
 func setLatestData(data Telemetry) {
 	dataMu.Lock()
+	defer dataMu.Unlock()
+
 	latestData = data
 	hasLatestData = true
-	dataMu.Unlock()
 }
+
+// ======================================================
+// SSE CLIENTS
+// ======================================================
 
 var (
 	clients   = make(map[chan Telemetry]struct{})
 	clientsMu sync.Mutex
 )
 
+// Send new telemetry to all connected SSE clients
 func broadcastTelemetry(data Telemetry) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
@@ -62,10 +90,18 @@ func broadcastTelemetry(data Telemetry) {
 	for ch := range clients {
 		select {
 		case ch <- data:
+			// Data sent successfully
+
 		default:
+			// Client is too slow.
+			// Do not block MQTT message handler.
 		}
 	}
 }
+
+// ======================================================
+// MQTT MESSAGE HANDLER
+// ======================================================
 
 var messageHandler mqtt.MessageHandler = func(
 	client mqtt.Client,
@@ -73,18 +109,38 @@ var messageHandler mqtt.MessageHandler = func(
 ) {
 	var data Telemetry
 
+	// --------------------------------------------------
+	// Parse MQTT JSON
+	// --------------------------------------------------
+
 	err := json.Unmarshal(msg.Payload(), &data)
+
 	if err != nil {
 		log.Println("JSON error:", err)
 		return
 	}
 
+	// --------------------------------------------------
+	// 1. Save latest data to RAM
+	// --------------------------------------------------
+
 	setLatestData(data)
+
+	// --------------------------------------------------
+	// 2. Send realtime data to SSE clients
+	// --------------------------------------------------
+
 	broadcastTelemetry(data)
 
+	// --------------------------------------------------
+	// 3. Save telemetry to Supabase PostgreSQL
+	// --------------------------------------------------
+
 	_, err = db.Exec(`
-		INSERT INTO telemetry (temperature, humidity, light)
-		VALUES ($1, $2, $3)
+		INSERT INTO telemetry
+			(temperature, humidity, light)
+		VALUES
+			($1, $2, $3)
 	`,
 		data.Temperature,
 		data.Humidity,
@@ -94,25 +150,43 @@ var messageHandler mqtt.MessageHandler = func(
 	if err != nil {
 		log.Println("Database INSERT error:", err)
 	} else {
-		fmt.Println("Saved to PostgreSQL!")
+		fmt.Println("Saved to Supabase PostgreSQL!")
 	}
 
+	// --------------------------------------------------
+	// 4. Print MQTT data
+	// --------------------------------------------------
+
 	fmt.Println("----- MQTT DATA -----")
-	fmt.Printf("Temperature: %.2f °C\n", data.Temperature)
-	fmt.Printf("Humidity:    %.2f %%\n", data.Humidity)
-	fmt.Printf("Light:       %.2f lux\n", data.Light)
+
+	fmt.Printf(
+		"Temperature: %.2f °C\n",
+		data.Temperature,
+	)
+
+	fmt.Printf(
+		"Humidity:    %.2f %%\n",
+		data.Humidity,
+	)
+
+	fmt.Printf(
+		"Light:       %.2f lux\n",
+		data.Light,
+	)
+
 	fmt.Println("---------------------")
 }
 
-//
+// ======================================================
 // SESSION
-//
+// ======================================================
 
 var (
 	sessions   = make(map[string]string)
 	sessionsMu sync.RWMutex
 )
 
+// Generate secure random session token
 func generateSessionToken() (string, error) {
 	bytes := make([]byte, 32)
 
@@ -124,8 +198,10 @@ func generateSessionToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(bytes), nil
 }
 
+// Create session
 func createSession(username string) (string, error) {
 	token, err := generateSessionToken()
+
 	if err != nil {
 		return "", err
 	}
@@ -137,6 +213,7 @@ func createSession(username string) (string, error) {
 	return token, nil
 }
 
+// Get username from session
 func getSessionUsername(token string) (string, bool) {
 	sessionsMu.RLock()
 	defer sessionsMu.RUnlock()
@@ -146,15 +223,25 @@ func getSessionUsername(token string) (string, bool) {
 	return username, ok
 }
 
+// Delete session
 func deleteSession(token string) {
 	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
 	delete(sessions, token)
-	sessionsMu.Unlock()
 }
 
-//
+// ======================================================
+// COOKIE CONFIGURATION
+// ======================================================
+
+func isProduction() bool {
+	return os.Getenv("ENV") == "production"
+}
+
+// ======================================================
 // AUTH MIDDLEWARE
-//
+// ======================================================
 
 func requireAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -162,30 +249,35 @@ func requireAuth() gin.HandlerFunc {
 		cookie, err := c.Cookie("session")
 
 		if err != nil {
-			c.Redirect(http.StatusFound, "/login")
+			c.Redirect(
+				http.StatusFound,
+				"/login",
+			)
 
 			c.Abort()
-
 			return
 		}
 
 		_, ok := getSessionUsername(cookie)
 
 		if !ok {
+
 			c.SetCookie(
 				"session",
 				"",
 				-1,
 				"/",
 				"",
-				false,
+				isProduction(),
 				true,
 			)
 
-			c.Redirect(http.StatusFound, "/login")
+			c.Redirect(
+				http.StatusFound,
+				"/login",
+			)
 
 			c.Abort()
-
 			return
 		}
 
@@ -193,16 +285,16 @@ func requireAuth() gin.HandlerFunc {
 	}
 }
 
-//
+// ======================================================
 // ENSURE ADMIN USER
-//
+// ======================================================
 
 func ensureAdminUser() {
 
 	adminPassword := os.Getenv("ADMIN_PASSWORD")
 
 	if adminPassword == "" {
-		adminPassword = "12345678"
+		log.Fatal("ADMIN_PASSWORD is not set")
 	}
 
 	var exists bool
@@ -216,14 +308,25 @@ func ensureAdminUser() {
 	`).Scan(&exists)
 
 	if err != nil {
-		log.Fatal("Check admin user error:", err)
+		log.Fatal(
+			"Check admin user error:",
+			err,
+		)
 	}
 
+	// Admin already exists
 	if exists {
-		fmt.Println("Admin user already exists!")
+
+		fmt.Println(
+			"Admin user already exists!",
+		)
 
 		return
 	}
+
+	// --------------------------------------------------
+	// Hash admin password
+	// --------------------------------------------------
 
 	passwordHash, err := bcrypt.GenerateFromPassword(
 		[]byte(adminPassword),
@@ -231,79 +334,235 @@ func ensureAdminUser() {
 	)
 
 	if err != nil {
-		log.Fatal("Password hash error:", err)
+		log.Fatal(
+			"Password hash error:",
+			err,
+		)
 	}
 
+	// --------------------------------------------------
+	// Create admin
+	// --------------------------------------------------
+
 	_, err = db.Exec(`
-		INSERT INTO users (username, password)
-		VALUES ($1, $2)
+		INSERT INTO users
+			(username, password)
+		VALUES
+			($1, $2)
 	`,
 		"admin",
 		string(passwordHash),
 	)
 
 	if err != nil {
-		log.Fatal("Create admin user error:", err)
+		log.Fatal(
+			"Create admin user error:",
+			err,
+		)
 	}
 
-	fmt.Println("Admin user created!")
+	fmt.Println(
+		"Admin user created!",
+	)
 }
+
+// ======================================================
+// CORS
+// ======================================================
+
+func setupCORS(r *gin.Engine) {
+
+	frontendURL := os.Getenv("FRONTEND_URL")
+
+	// Local development
+	if frontendURL == "" {
+		frontendURL = "http://localhost:5500"
+	}
+
+	r.Use(cors.New(cors.Config{
+		AllowOrigins: []string{
+			frontendURL,
+			"http://localhost:5500",
+			"http://127.0.0.1:5500",
+		},
+
+		AllowMethods: []string{
+			"GET",
+			"POST",
+			"OPTIONS",
+		},
+
+		AllowHeaders: []string{
+			"Origin",
+			"Content-Type",
+			"Accept",
+		},
+
+		AllowCredentials: true,
+
+		MaxAge: 12 * time.Hour,
+	}))
+}
+
+// ======================================================
+// WEB DIRECTORY
+// ======================================================
+
+func getWebDirectory() string {
+
+	// User can explicitly set WEB_DIR
+	webDir := os.Getenv("WEB_DIR")
+
+	if webDir != "" {
+		return webDir
+	}
+
+	// Try ../web
+	parentWeb := filepath.Join("..", "web")
+
+	if _, err := os.Stat(parentWeb); err == nil {
+		return parentWeb
+	}
+
+	// Try ./web
+	currentWeb := filepath.Join(".", "web")
+
+	if _, err := os.Stat(currentWeb); err == nil {
+		return currentWeb
+	}
+
+	return "../web"
+}
+
+// ======================================================
+// MAIN
+// ======================================================
 
 func main() {
 
-	//
-	// PostgreSQL
-	//
+	// ==================================================
+	// 0. LOAD .ENV
+	// ==================================================
 
-	pgUser := os.Getenv("PG_USER")
-
-	if pgUser == "" {
-		pgUser = "postgres"
-	}
-
-	pgPassword := os.Getenv("PG_PASSWORD")
-
-	connStr := fmt.Sprintf(
-		"host=localhost port=5432 user=%s password=%s dbname=iot_db sslmode=disable",
-		pgUser,
-		pgPassword,
-	)
-
-	var err error
-
-	db, err = sql.Open("postgres", connStr)
+	err := godotenv.Load()
 
 	if err != nil {
-		log.Fatal("Database open error:", err)
+		log.Println(
+			".env file not found, using system environment variables",
+		)
 	}
+
+	// ==================================================
+	// 1. SUPABASE POSTGRESQL
+	// ==================================================
+
+	databaseURL := os.Getenv("DATABASE_URL")
+
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is not set")
+	}
+
+	db, err = sql.Open(
+		"postgres",
+		databaseURL,
+	)
+
+	if err != nil {
+		log.Fatal(
+			"Database open error:",
+			err,
+		)
+	}
+
+	defer db.Close()
+
+	// --------------------------------------------------
+	// Test database connection
+	// --------------------------------------------------
 
 	err = db.Ping()
 
 	if err != nil {
-		log.Fatal("Database connection error:", err)
+		log.Fatal(
+			"Database connection error:",
+			err,
+		)
 	}
 
-	fmt.Println("PostgreSQL connected!")
+	fmt.Println(
+		"Supabase PostgreSQL connected!",
+	)
 
-	//
-	// Admin
-	//
+	// ==================================================
+	// 2. ADMIN USER
+	// ==================================================
 
 	ensureAdminUser()
 
-	//
-	// MQTT
-	//
+	// ==================================================
+	// 3. HIVE MQ CLOUD
+	// ==================================================
+
+	mqttHost := os.Getenv("MQTT_HOST")
+	mqttUsername := os.Getenv("MQTT_USERNAME")
+	mqttPassword := os.Getenv("MQTT_PASSWORD")
+
+	if mqttHost == "" {
+		log.Fatal("MQTT_HOST is not set")
+	}
+
+	if mqttUsername == "" {
+		log.Fatal("MQTT_USERNAME is not set")
+	}
+
+	if mqttPassword == "" {
+		log.Fatal("MQTT_PASSWORD is not set")
+	}
+
+	// --------------------------------------------------
+	// MQTT options
+	// --------------------------------------------------
 
 	opts := mqtt.NewClientOptions()
 
-	opts.AddBroker("tcp://localhost:1883")
+	opts.AddBroker(
+		"ssl://" + mqttHost + ":8883",
+	)
 
-	opts.SetClientID("go-iot-backend")
+	opts.SetUsername(
+		mqttUsername,
+	)
 
-	opts.OnConnect = func(client mqtt.Client) {
+	opts.SetPassword(
+		mqttPassword,
+	)
 
-		fmt.Println("MQTT connected!")
+	opts.SetClientID(
+		"go-iot-backend",
+	)
+
+	// --------------------------------------------------
+	// TLS
+	// --------------------------------------------------
+
+	opts.SetTLSConfig(
+		&tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: mqttHost,
+		},
+	)
+
+	// --------------------------------------------------
+	// MQTT connected callback
+	// --------------------------------------------------
+
+	opts.OnConnect = func(
+		client mqtt.Client,
+	) {
+
+		fmt.Println(
+			"MQTT HiveMQ Cloud connected!",
+		)
 
 		token := client.Subscribe(
 			"iot/sensors",
@@ -314,6 +573,7 @@ func main() {
 		token.Wait()
 
 		if token.Error() != nil {
+
 			log.Println(
 				"Subscribe error:",
 				token.Error(),
@@ -327,15 +587,24 @@ func main() {
 		)
 	}
 
+	// --------------------------------------------------
+	// MQTT connection lost
+	// --------------------------------------------------
+
 	opts.OnConnectionLost = func(
 		client mqtt.Client,
 		err error,
 	) {
+
 		log.Println(
 			"MQTT connection lost:",
 			err,
 		)
 	}
+
+	// ==================================================
+	// Create MQTT client
+	// ==================================================
 
 	client := mqtt.NewClient(opts)
 
@@ -344,271 +613,453 @@ func main() {
 	token.Wait()
 
 	if token.Error() != nil {
+
 		log.Fatal(
 			"MQTT connection error:",
 			token.Error(),
 		)
 	}
 
-	//
-	// GIN
-	//
+	// ==================================================
+	// 4. GIN WEB SERVER
+	// ==================================================
 
 	r := gin.Default()
 
-	//
-	// Login page
-	//
+	// ==================================================
+	// 5. CORS
+	// ==================================================
 
-	r.GET("/login", func(c *gin.Context) {
+	setupCORS(r)
 
-		c.File("../../web/login.html")
-	})
+	// ==================================================
+	// 6. WEB DIRECTORY
+	// ==================================================
 
-	//
-	// Login API
-	//
+	webDir := getWebDirectory()
 
-	r.POST("/api/login", func(c *gin.Context) {
+	fmt.Println(
+		"Web directory:",
+		webDir,
+	)
 
-		var request LoginRequest
+	// ==================================================
+	// 7. LOGIN PAGE
+	// ==================================================
 
-		if err := c.ShouldBindJSON(&request); err != nil {
+	r.GET(
+		"/login",
+		func(c *gin.Context) {
 
-			c.JSON(
-				http.StatusBadRequest,
-				gin.H{
-					"error": "Invalid request",
-				},
+			c.File(
+				filepath.Join(
+					webDir,
+					"login.html",
+				),
+			)
+		},
+	)
+
+	// ==================================================
+	// 8. LOGIN API
+	// ==================================================
+
+	r.POST(
+		"/api/login",
+		func(c *gin.Context) {
+
+			var request LoginRequest
+
+			// --------------------------------------------------
+			// Read JSON
+			// --------------------------------------------------
+
+			if err := c.ShouldBindJSON(
+				&request,
+			); err != nil {
+
+				c.JSON(
+					http.StatusBadRequest,
+					gin.H{
+						"error": "Invalid request",
+					},
+				)
+
+				return
+			}
+
+			// --------------------------------------------------
+			// Validate input
+			// --------------------------------------------------
+
+			if request.Username == "" ||
+				request.Password == "" {
+
+				c.JSON(
+					http.StatusBadRequest,
+					gin.H{
+						"error": "Username and password are required",
+					},
+				)
+
+				return
+			}
+
+			// --------------------------------------------------
+			// Get password hash
+			// --------------------------------------------------
+
+			var passwordHash string
+
+			err := db.QueryRow(`
+				SELECT password
+				FROM users
+				WHERE username = $1
+			`,
+				request.Username,
+			).Scan(
+				&passwordHash,
 			)
 
-			return
-		}
+			if err != nil {
 
-		var passwordHash string
+				if err == sql.ErrNoRows {
 
-		err := db.QueryRow(`
-			SELECT password
-			FROM users
-			WHERE username = $1
-		`,
-			request.Username,
-		).Scan(&passwordHash)
+					c.JSON(
+						http.StatusUnauthorized,
+						gin.H{
+							"error": "Invalid username or password",
+						},
+					)
 
-		if err != nil {
+					return
+				}
 
-			c.JSON(
-				http.StatusUnauthorized,
-				gin.H{
-					"error": "Invalid username or password",
-				},
+				log.Println(
+					"Database login error:",
+					err,
+				)
+
+				c.JSON(
+					http.StatusInternalServerError,
+					gin.H{
+						"error": "Database error",
+					},
+				)
+
+				return
+			}
+
+			// --------------------------------------------------
+			// Compare password
+			// --------------------------------------------------
+
+			err = bcrypt.CompareHashAndPassword(
+				[]byte(passwordHash),
+				[]byte(request.Password),
 			)
 
-			return
-		}
+			if err != nil {
 
-		err = bcrypt.CompareHashAndPassword(
-			[]byte(passwordHash),
-			[]byte(request.Password),
-		)
+				c.JSON(
+					http.StatusUnauthorized,
+					gin.H{
+						"error": "Invalid username or password",
+					},
+				)
 
-		if err != nil {
+				return
+			}
 
-			c.JSON(
-				http.StatusUnauthorized,
-				gin.H{
-					"error": "Invalid username or password",
-				},
+			// --------------------------------------------------
+			// Create session
+			// --------------------------------------------------
+
+			sessionToken, err := createSession(
+				request.Username,
 			)
 
-			return
-		}
+			if err != nil {
 
-		sessionToken, err := createSession(
-			request.Username,
-		)
+				c.JSON(
+					http.StatusInternalServerError,
+					gin.H{
+						"error": "Cannot create session",
+					},
+				)
 
-		if err != nil {
+				return
+			}
 
-			c.JSON(
-				http.StatusInternalServerError,
-				gin.H{
-					"error": "Cannot create session",
-				},
+			// --------------------------------------------------
+			// Set session cookie
+			// --------------------------------------------------
+
+			c.SetCookie(
+				"session",
+				sessionToken,
+				60*60*8,
+				"/",
+				"",
+				isProduction(),
+				true,
 			)
 
-			return
-		}
+			c.JSON(
+				http.StatusOK,
+				gin.H{
+					"message": "Login successful",
+				},
+			)
+		},
+	)
 
-		c.SetCookie(
-			"session",
-			sessionToken,
-			60*60*8,
-			"/",
-			"",
-			false,
-			true,
-		)
+	// ==================================================
+	// 9. LOGOUT API
+	// ==================================================
 
-		c.JSON(
-			http.StatusOK,
-			gin.H{
-				"message": "Login successful",
-			},
-		)
-	})
+	r.POST(
+		"/api/logout",
+		func(c *gin.Context) {
 
-	//
-	// Logout
-	//
+			cookie, err := c.Cookie(
+				"session",
+			)
 
-	r.POST("/api/logout", func(c *gin.Context) {
+			if err == nil {
+				deleteSession(cookie)
+			}
 
-		cookie, err := c.Cookie("session")
+			c.SetCookie(
+				"session",
+				"",
+				-1,
+				"/",
+				"",
+				isProduction(),
+				true,
+			)
 
-		if err == nil {
-			deleteSession(cookie)
-		}
+			c.JSON(
+				http.StatusOK,
+				gin.H{
+					"message": "Logged out",
+				},
+			)
+		},
+	)
 
-		c.SetCookie(
-			"session",
-			"",
-			-1,
-			"/",
-			"",
-			false,
-			true,
-		)
-
-		c.JSON(
-			http.StatusOK,
-			gin.H{
-				"message": "Logged out",
-			},
-		)
-	})
-
-	//
-	// Protected routes
-	//
+	// ==================================================
+	// 10. PROTECTED ROUTES
+	// ==================================================
 
 	protected := r.Group("/")
 
-	protected.Use(requireAuth())
+	protected.Use(
+		requireAuth(),
+	)
 
-	{
-		protected.StaticFile(
-			"/style.css",
-			"../../web/style.css",
-		)
+	// ==================================================
+	// 11. WEB FILES
+	// ==================================================
 
-		protected.StaticFile(
-			"/app.js",
-			"../../web/app.js",
-		)
+	protected.StaticFile(
+		"/style.css",
+		filepath.Join(
+			webDir,
+			"style.css",
+		),
+	)
 
-		protected.GET("/", func(c *gin.Context) {
+	protected.StaticFile(
+		"/app.js",
+		filepath.Join(
+			webDir,
+			"app.js",
+		),
+	)
 
-			c.File("../../web/index.html")
-		})
+	// ==================================================
+	// 12. DASHBOARD
+	// ==================================================
 
-		protected.GET(
-			"/api/telemetry",
-			func(c *gin.Context) {
+	protected.GET(
+		"/",
+		func(c *gin.Context) {
 
-				c.Header(
-					"Content-Type",
-					"text/event-stream",
-				)
+			c.File(
+				filepath.Join(
+					webDir,
+					"index.html",
+				),
+			)
+		},
+	)
 
-				c.Header(
-					"Cache-Control",
-					"no-cache",
-				)
+	// ==================================================
+	// 13. SSE TELEMETRY
+	// ==================================================
 
-				c.Header(
-					"Connection",
-					"keep-alive",
-				)
+	protected.GET(
+		"/api/telemetry",
+		func(c *gin.Context) {
 
-				c.Header(
-					"X-Accel-Buffering",
-					"no",
-				)
+			// --------------------------------------------------
+			// SSE headers
+			// --------------------------------------------------
 
-				ch := make(chan Telemetry, 1)
+			c.Header(
+				"Content-Type",
+				"text/event-stream",
+			)
+
+			c.Header(
+				"Cache-Control",
+				"no-cache",
+			)
+
+			c.Header(
+				"Connection",
+				"keep-alive",
+			)
+
+			c.Header(
+				"X-Accel-Buffering",
+				"no",
+			)
+
+			// --------------------------------------------------
+			// Create SSE client channel
+			// --------------------------------------------------
+
+			ch := make(
+				chan Telemetry,
+				1,
+			)
+
+			clientsMu.Lock()
+
+			clients[ch] = struct{}{}
+
+			clientsMu.Unlock()
+
+			// --------------------------------------------------
+			// Remove client when disconnected
+			// --------------------------------------------------
+
+			defer func() {
 
 				clientsMu.Lock()
 
-				clients[ch] = struct{}{}
+				delete(
+					clients,
+					ch,
+				)
 
 				clientsMu.Unlock()
 
-				defer func() {
+			}()
 
-					clientsMu.Lock()
+			// --------------------------------------------------
+			// Send latest RAM data immediately
+			// --------------------------------------------------
 
-					delete(clients, ch)
+			if data, ok := getLatestData(); ok {
 
-					close(ch)
+				payload, err := json.Marshal(
+					data,
+				)
 
-					clientsMu.Unlock()
-				}()
+				if err == nil {
 
-				if data, ok := getLatestData(); ok {
+					fmt.Fprintf(
+						c.Writer,
+						"data: %s\n\n",
+						payload,
+					)
 
-					payload, err := json.Marshal(data)
-
-					if err == nil {
-
-						fmt.Fprintf(
-							c.Writer,
-							"data: %s\n\n",
-							payload,
-						)
-
-						c.Writer.Flush()
-					}
+					c.Writer.Flush()
 				}
+			}
 
-				for {
+			// --------------------------------------------------
+			// SSE loop
+			// --------------------------------------------------
 
-					select {
+			heartbeat := time.NewTicker(
+				25 * time.Second,
+			)
 
-					case <-c.Request.Context().Done():
+			defer heartbeat.Stop()
 
-						return
+			for {
 
-					case data := <-ch:
+				select {
 
-						payload, err := json.Marshal(data)
+				// Browser disconnected
+				case <-c.Request.Context().Done():
 
-						if err != nil {
-							continue
-						}
+					return
 
-						fmt.Fprintf(
-							c.Writer,
-							"data: %s\n\n",
-							payload,
-						)
+				// New MQTT telemetry
+				case data := <-ch:
 
-						c.Writer.Flush()
+					payload, err := json.Marshal(
+						data,
+					)
+
+					if err != nil {
+						continue
 					}
+
+					fmt.Fprintf(
+						c.Writer,
+						"data: %s\n\n",
+						payload,
+					)
+
+					c.Writer.Flush()
+
+				// Keep SSE connection alive
+				case <-heartbeat.C:
+
+					fmt.Fprint(
+						c.Writer,
+						": heartbeat\n\n",
+					)
+
+					c.Writer.Flush()
 				}
-			},
+			}
+		},
+	)
+
+	// ==================================================
+	// 14. START SERVER
+	// ==================================================
+
+	port := os.Getenv("PORT")
+
+	if port == "" {
+		port = "8080"
+	}
+
+	// Make sure PORT is valid
+	if _, err := strconv.Atoi(port); err != nil {
+		log.Fatal(
+			"Invalid PORT:",
+			port,
 		)
 	}
 
-	//
-	// Server
-	//
-
 	fmt.Println(
-		"HTTP server running on http://localhost:8080",
+		"HTTP server running on port:",
+		port,
 	)
 
-	err = r.Run(":8080")
+	err = r.Run(
+		":" + port,
+	)
 
 	if err != nil {
 		log.Fatal(err)
